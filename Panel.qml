@@ -20,6 +20,7 @@ Panel {
   // State exposed to the UI
   property bool ecoActive: false
   property bool autoSwitch: false
+  property bool showTimeInBar: false
   property bool adjustBlur: true
   property bool adjustOpacity: true
   property bool adjustAnimations: true
@@ -33,7 +34,10 @@ Panel {
   property real   batteryWatts: 0.0
   property bool   acOnline: false
   property string batteryState: ""
-
+  property real   batteryHealth: 100.0
+  property real   realCapWh: 0.0
+  property real   designCapWh: 0.0
+  property real   energyNowWh: 0.0
   property bool loaded: false
   property bool actionRunning: false
 
@@ -68,6 +72,7 @@ Panel {
       var d = JSON.parse(text)
       root.ecoActive           = d.active            === true
       root.autoSwitch          = d.auto_switch        === true
+      if (d.show_time_in_bar !== undefined) root.showTimeInBar = d.show_time_in_bar === true
       root.adjustBlur          = d.adjust_blur        !== false
       root.adjustOpacity       = d.adjust_opacity     !== false
       root.adjustAnimations    = d.adjust_animations  !== false
@@ -76,14 +81,27 @@ Panel {
       root.adjustPowerProfile  = d.adjust_powerprofile !== false
 
       var t = d.telemetry || {}
-      root.batteryPct   = t.percentage  || ""
-      root.batteryTime  = t.time        || ""
-      root.batteryWatts = t.rate_watts  || 0.0
-      root.acOnline     = t.ac_online   === true
-      root.batteryState = t.state       || ""
+      root.batteryPct      = t.percentage          || ""
+      root.batteryTime     = t.time                || ""
+      root.batteryWatts    = t.rate_watts          || 0.0
+      root.acOnline        = t.ac_online           === true
+      root.batteryState    = t.state               || ""
+      root.batteryHealth   = t.health_pct          || 100.0
+      root.realCapWh       = t.capacity_real_wh    || 0.0
+      root.designCapWh     = t.capacity_design_wh  || 0.0
+      root.energyNowWh     = t.energy_now_wh       || 0.0
 
       root.loaded = true
     } catch (e) {}
+  }
+
+  function toggleShowTime() {
+    root.showTimeInBar = !root.showTimeInBar
+    root.setConfigKey("show_time_in_bar", root.showTimeInBar)
+    if (root.settings) {
+      root.settings = Object.assign({}, root.settings, { showTimeInBar: root.showTimeInBar })
+      if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+    }
   }
 
   function runToggle(force) {
@@ -146,8 +164,12 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰌪"
-    tooltipText: root.tooltipLabel
+    text: root.showTimeInBar && !vertical && root.batteryTime !== ""
+      ? root.batteryTime + " 󰌪"
+      : "󰌪"
+    slotSize: Style.bar.iconSlot * (root.showTimeInBar && !vertical && root.batteryTime !== "" ? 2.8 : 1)
+    opticalSize: root.showTimeInBar && !vertical && root.batteryTime !== "" ? slotSize : Style.bar.iconCanvas
+    tooltipText: root.tooltipLabel + "\n(Right-click to toggle time display)"
     foreground: root.ecoActive
       ? "#4ade80"
       : (root.bar ? root.bar.foreground : Color.foreground)
@@ -155,7 +177,11 @@ Panel {
     Behavior on foreground { ColorAnimation { duration: 200 } }
 
     onPressed: function(b) {
-      if (b === Qt.LeftButton || b === Qt.MiddleButton) root.toggle()
+      if (b === Qt.RightButton) {
+        root.toggleShowTime()
+      } else if (b === Qt.LeftButton || b === Qt.MiddleButton) {
+        root.toggle()
+      }
     }
   }
 
@@ -278,6 +304,27 @@ Panel {
 
             Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
             Behavior on color { ColorAnimation { duration: 200 } }
+          }
+        }
+        // ── Battery Health & Real Capacity stats ──
+        RowLayout {
+          width: parent.width
+          visible: root.realCapWh > 0
+
+          Text {
+            text: "Health: " + Math.round(root.batteryHealth) + "%"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Item { Layout.fillWidth: true }
+
+          Text {
+            text: "Real: " + root.realCapWh + "Wh (Design: " + root.designCapWh + "Wh)"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
           }
         }
 

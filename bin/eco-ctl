@@ -37,6 +37,7 @@ BAT_NOW_CANDIDATES = [
 DEFAULT_CONFIG = {
     "active":              False,
     "auto_switch_battery": False,
+    "show_time_in_bar":    False,
     "adjust_blur":         True,
     "adjust_opacity":      True,
     "adjust_animations":   True,
@@ -129,27 +130,138 @@ def set_brightness_pct(pct: int):
     run(["brightnessctl", "set", f"{max(5, min(100, pct))}%"])
 
 
-def get_power_draw_watts() -> float:
-    """Read instantaneous power draw from sysfs (fastest, no UPower latency)."""
-    for p in BAT_NOW_CANDIDATES:
-        path = Path(p)
-        if path.exists():
+def compute_battery_telemetry() -> dict:
+    """Compute battery telemetry grounded in REAL degraded capacity from sysfs."""
+    bat_dir = None
+    for cand in ["BAT1", "BAT0", "BAT"]:
+        p = POWER_SUPPLY / cand
+        if p.exists() and (p / "present").exists() and (p / "present").read_text().strip() == "1":
+            bat_dir = p
+            break
+
+    if not bat_dir:
+        for p in POWER_SUPPLY.glob("BAT*"):
+            if (p / "present").exists() and (p / "present").read_text().strip() == "1":
+                bat_dir = p
+                break
+
+    def read_int(name, default=0):
+        if not bat_dir:
+            return default
+        f = bat_dir / name
+        if f.exists():
             try:
-                return int(path.read_text().strip()) / 1_000_000
+                return int(f.read_text().strip())
             except Exception:
                 pass
-    return 0.0
+        return default
 
+    def read_str(name, default=""):
+        if not bat_dir:
+            return default
+        f = bat_dir / name
+        if f.exists():
+            try:
+                return f.read_text().strip()
+            except Exception:
+                pass
+        return default
 
-def get_battery_info() -> dict:
-    """Return battery telemetry dict via omarchy-battery-status --shell."""
-    raw = run(["omarchy-battery-status", "--shell"])
-    info: dict = {}
-    for line in raw.splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2:
-            info[parts[0].strip()] = parts[1].strip()
-    return info
+    status = read_str("status", "Discharging")
+    voltage_now = read_int("voltage_now", 11_190_000)   # uV
+    charge_now = read_int("charge_now", 0)              # uAh (REAL remaining charge)
+    charge_full = read_int("charge_full", 0)            # uAh (REAL degraded full capacity)
+    charge_design = read_int("charge_full_design", 0)   # uAh (Factory design capacity)
+    current_now = read_int("current_now", 0)            # uA (Instantaneous draw)
+
+    energy_now = read_int("energy_now", 0)              # uWh
+    energy_full = read_int("energy_full", 0)            # uWh
+    energy_design = read_int("energy_full_design", 0)   # uWh
+    power_now = read_int("power_now", 0)                # uW
+
+    if charge_now > 0 and voltage_now > 0:
+        energy_now_wh = (charge_now * voltage_now) / 1e12
+        energy_full_wh = (charge_full * voltage_now) / 1e12
+        energy_design_wh = (charge_design * voltage_now) / 1e12
+        watts = (current_now * voltage_now) / 1e12
+    elif energy_now > 0:
+        energy_now_wh = energy_now / 1e6
+        energy_full_wh = energy_full / 1e6
+        energy_design_wh = energy_design / 1e6
+        watts = power_now / 1e6
+    else:
+        energy_now_wh = 0.0
+        energy_full_wh = 0.0
+        energy_design_wh = 0.0
+        watts = 0.0
+
+    # Percentage calculation based on REAL degraded capacity
+    if charge_full > 0:
+        pct = int(round((charge_now / charge_full) * 100))
+    elif energy_full_wh > 0:
+        pct = int(round((energy_now_wh / energy_full_wh) * 100))
+    else:
+        pct = read_int("capacity", 0)
+
+    # Battery health: real full / factory design
+    if charge_design > 0:
+        health_pct = round((charge_full / charge_design) * 100, 1)
+    elif energy_design_wh > 0:
+        health_pct = round((energy_full_wh / energy_design_wh) * 100, 1)
+    else:
+        health_pct = 100.0
+
+    # Time left calculation (Grounded in REAL remaining charge, not design!)
+    time_str = ""
+    if status == "Discharging":
+        if charge_now > 0 and current_now > 0:
+            hours = charge_now / current_now
+        elif energy_now_wh > 0 and watts > 0:
+            hours = energy_now_wh / watts
+        else:
+            hours = 0.0
+
+        if hours > 0:
+            h = int(hours)
+            m = int((hours - h) * 60)
+            time_str = f"{h}h {m}m" if h > 0 else f"{m}m"
+    elif status == "Charging":
+        # Time to full is calculated toward REAL full capacity, not factory capacity!
+        if charge_full > charge_now and current_now > 0:
+            hours = (charge_full - charge_now) / current_now
+        elif energy_full_wh > energy_now_wh and watts > 0:
+            hours = (energy_full_wh - energy_now_wh) / watts
+        else:
+            hours = 0.0
+
+        if hours > 0:
+            h = int(hours)
+            m = int((hours - h) * 60)
+            time_str = f"{h}h {m}m" if h > 0 else f"{m}m"
+    elif status == "Full":
+        time_str = "Full"
+
+    # Fallback to omarchy-battery-status if sysfs calculation could not resolve
+    if not time_str:
+        fb = get_battery_info()
+        time_str = fb.get("time", "")
+        if pct == 0:
+            try:
+                pct = int(re.sub(r"[^\d]", "", fb.get("percentage", "0")))
+            except Exception:
+                pass
+
+    return {
+        "percentage": f"{pct}%",
+        "time": time_str,
+        "rate_watts": round(watts, 1),
+        "ac_online": is_ac_online(),
+        "state": status.lower(),
+        "health_pct": health_pct,
+        "capacity_real_wh": round(energy_full_wh, 1),
+        "capacity_design_wh": round(energy_design_wh, 1),
+        "energy_now_wh": round(energy_now_wh, 1),
+    }
 
 
 def is_ac_online() -> bool:
@@ -242,33 +354,19 @@ def notify(summary: str, body: str = "", icon: str = "battery"):
 
 def cmd_get():
     cfg = load_config()
-    battery = get_battery_info()
-    ac = is_ac_online()
-    watts = get_power_draw_watts()
-    # Use live sysfs watts when available; fall back to upower rate field
-    if watts == 0.0:
-        rate_str = battery.get("rate", "0W")
-        try:
-            watts = float(re.sub(r"[^\d.]", "", rate_str))
-        except Exception:
-            watts = 0.0
+    telemetry = compute_battery_telemetry()
 
     out = {
-        "active":            cfg.get("active", False),
-        "auto_switch":       cfg.get("auto_switch_battery", False),
-        "adjust_blur":       cfg.get("adjust_blur", True),
-        "adjust_opacity":    cfg.get("adjust_opacity", True),
-        "adjust_animations": cfg.get("adjust_animations", True),
-        "adjust_brightness": cfg.get("adjust_brightness", True),
-        "target_brightness": cfg.get("target_brightness", 35),
+        "active":              cfg.get("active", False),
+        "auto_switch":         cfg.get("auto_switch_battery", False),
+        "show_time_in_bar":    cfg.get("show_time_in_bar", False),
+        "adjust_blur":         cfg.get("adjust_blur", True),
+        "adjust_opacity":      cfg.get("adjust_opacity", True),
+        "adjust_animations":   cfg.get("adjust_animations", True),
+        "adjust_brightness":   cfg.get("adjust_brightness", True),
+        "target_brightness":   cfg.get("target_brightness", 35),
         "adjust_powerprofile": cfg.get("adjust_powerprofile", True),
-        "telemetry": {
-            "percentage":  battery.get("percentage", ""),
-            "time":        battery.get("time", ""),
-            "rate_watts":  round(watts, 1),
-            "ac_online":   ac,
-            "state":       battery.get("state", ""),
-        },
+        "telemetry":           telemetry,
     }
     print(json.dumps(out))
 
@@ -381,7 +479,7 @@ def cmd_set_config(key: str, value: str):
     """Persist a single user preference."""
     cfg = load_config()
     bool_keys = {
-        "auto_switch_battery", "adjust_blur", "adjust_opacity",
+        "auto_switch_battery", "show_time_in_bar", "adjust_blur", "adjust_opacity",
         "adjust_animations", "adjust_brightness", "adjust_powerprofile",
     }
     int_keys = {"target_brightness"}

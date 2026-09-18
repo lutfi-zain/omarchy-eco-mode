@@ -14,15 +14,38 @@ Built specifically for AMD Ryzen + Radeon Vega integrated graphics laptops where
 
 ---
 
-## Status Bar Indicator
+## Status Bar Indicator & Right-Click Toggle
 
-The plugin lives in the right section of the Omarchy top bar. The leaf icon (🌿) provides immediate visual feedback:
+The plugin lives in the right section of the Omarchy top bar.
+
+<div align="center">
+
+![Bar with Time Left](docs/screenshots/bar-time.png)
+
+*Status bar displaying real-time remaining battery life and eco status icon.*
+
+</div>
+
+### Bar Interactions
+- **Left Click**: Open / close the Eco Mode configuration dropdown panel.
+- **Right Click**: Toggle the bar display between **Icon only** (`󰌪`) and **Time left + Icon** (`1h 25m 󰌪`).
 
 | State | Indicator | Power Draw |
 |---|---|---|
-| **Eco OFF** (Normal / Aesthetic) | Foreground colored icon | ~11–16W (with 3-pass blur) |
-| **Eco ON** (Battery Saver) | Bright green icon | ~5–7W |
+| **Eco OFF** (Normal / Aesthetic) | Foreground colored icon / time | ~11–16W (with 3-pass blur) |
+| **Eco ON** (Battery Saver) | Bright green icon / time | ~5–7W |
 
+---
+
+## Accurate Telemetry (Real vs Design Capacity)
+
+Many laptops have degraded batteries (e.g., 60%–80% health). Generic tools often compute remaining time using factory design capacity or smoothed averages that lag by minutes.
+
+`lutfi.eco` reads directly from the Linux kernel sysfs (`/sys/class/power_supply/`):
+- **Percentage**: computed strictly as `charge_now / charge_full` (real degraded capacity, not design).
+- **Remaining Time**: computed instantaneously as `charge_now / current_now` (or `energy_now / power_now`).
+- **Time to Full**: computed toward `charge_full` (real full capacity), preventing premature or dragging estimates.
+- **Panel Stats**: displays actual battery health percentage and real Wh vs factory design Wh for full transparency.
 ---
 
 ## What it does
