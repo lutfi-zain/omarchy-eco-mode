@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""
+eco-ctl — Eco Mode backend controller for lutfi.eco Omarchy plugin.
+
+Commands:
+  get               Print current state as JSON (telemetry + config + active status).
+  toggle [on|off]   Toggle eco mode on or off (omit arg to flip current state).
+  set-config <k> <v> Persist a user preference to config.json.
+  poll              Detect AC↔battery transitions; auto-trigger toggle if configured.
+
+State files:
+  ~/.local/state/omarchy/lutfi.eco/config.json   — user preferences (persistent)
+  ~/.local/state/omarchy/lutfi.eco/snapshot.json — pre-eco Hyprland/brightness values
+"""
+import sys
+import json
+import subprocess
+import re
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+STATE_DIR      = Path.home() / ".local/state/omarchy/lutfi.eco"
+CONFIG_FILE    = STATE_DIR / "config.json"
+SNAPSHOT_FILE  = STATE_DIR / "snapshot.json"
+GLASS_CTL      = Path.home() / ".config/omarchy/plugins/lutfi.glass/bin/glass-ctl"
+POWER_SUPPLY   = Path("/sys/class/power_supply")
+BAT_NOW_CANDIDATES = [
+    "/sys/class/power_supply/BAT1/power_now",
+    "/sys/class/power_supply/BAT0/power_now",
+]
+
+# ---------------------------------------------------------------------------
+# Default user configuration
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "active":              False,
+    "auto_switch_battery": False,
+    "adjust_blur":         True,
+    "adjust_opacity":      True,
+    "adjust_animations":   True,
+    "adjust_brightness":   True,
+    "target_brightness":   35,    # percent 20-70
+    "adjust_powerprofile": True,
+    # Last known AC state — used by poll to detect transitions
+    "_last_ac": None,
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_config() -> dict:
+    ensure_state_dir()
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(CONFIG_FILE.read_text()))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg: dict):
+    ensure_state_dir()
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def load_snapshot() -> dict:
+    if SNAPSHOT_FILE.exists():
+        try:
+            return json.loads(SNAPSHOT_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_snapshot(snap: dict):
+    ensure_state_dir()
+    SNAPSHOT_FILE.write_text(json.dumps(snap, indent=2) + "\n")
+
+
+def run(cmd: list[str]) -> str:
+    """Run a command, return stdout; never raises — returns '' on failure."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def hypr_get(option: str):
+    """Read a Hyprland option value dict."""
+    out = run(["hyprctl", "-j", "getoption", option])
+    try:
+        return json.loads(out)
+    except Exception:
+        return {}
+
+
+def hypr_eval(lua: str):
+    """Apply a Hyprland config change via eval (required for Lua-based hyprland.conf)."""
+    run(["hyprctl", "eval", lua])
+
+
+def get_brightness_raw() -> int:
+    """Return current absolute brightness value via brightnessctl."""
+    out = run(["brightnessctl", "get"])
+    try:
+        return int(out.strip())
+    except Exception:
+        return -1
+
+
+def get_brightness_max() -> int:
+    out = run(["brightnessctl", "max"])
+    try:
+        return int(out.strip())
+    except Exception:
+        return 65535
+
+
+def set_brightness_pct(pct: int):
+    run(["brightnessctl", "set", f"{max(5, min(100, pct))}%"])
+
+
+def get_power_draw_watts() -> float:
+    """Read instantaneous power draw from sysfs (fastest, no UPower latency)."""
+    for p in BAT_NOW_CANDIDATES:
+        path = Path(p)
+        if path.exists():
+            try:
+                return int(path.read_text().strip()) / 1_000_000
+            except Exception:
+                pass
+    return 0.0
+
+
+def get_battery_info() -> dict:
+    """Return battery telemetry dict via omarchy-battery-status --shell."""
+    raw = run(["omarchy-battery-status", "--shell"])
+    info: dict = {}
+    for line in raw.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            info[parts[0].strip()] = parts[1].strip()
+    return info
+
+
+def is_ac_online() -> bool:
+    """Check /sys/class/power_supply for any Mains supply that is online."""
+    try:
+        for supply in POWER_SUPPLY.iterdir():
+            t = (supply / "type")
+            o = (supply / "online")
+            if t.exists() and o.exists():
+                if t.read_text().strip() == "Mains" and o.read_text().strip() == "1":
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def get_glass_state() -> dict:
+    """Read lutfi.glass current settings via glass-ctl get."""
+    if GLASS_CTL.exists():
+        out = run([str(GLASS_CTL), "get"])
+        try:
+            return json.loads(out)
+        except Exception:
+            pass
+    # Fallback: query Hyprland directly
+    blur_en = hypr_get("decoration:blur:enabled").get("bool", True)
+    active_op = hypr_get("decoration:active_opacity").get("float", 0.92)
+    inactive_op = hypr_get("decoration:inactive_opacity").get("float", 0.82)
+    passes = hypr_get("decoration:blur:passes").get("int", 3)
+    size = hypr_get("decoration:blur:size").get("int", 3)
+    return {
+        "blurEnabled": blur_en,
+        "activeOpacity": round(active_op, 2),
+        "inactiveOpacity": round(inactive_op, 2),
+        "blurPasses": passes,
+        "blurSize": size,
+        "barBlur": True,
+        "barColorMode": "theme",
+        "barColor": "",
+        "barGlassOpacity": 0.60,
+    }
+
+
+def restore_glass_state(snap: dict):
+    """Restore lutfi.glass settings from snapshot by calling glass-ctl set."""
+    if not GLASS_CTL.exists():
+        # Fallback: restore via hyprctl eval (Lua parser required)
+        blur_val = "true" if snap.get("blurEnabled", True) else "false"
+        hypr_eval(f"hl.config({{ decoration = {{ blur = {{ enabled = {blur_val} }}, active_opacity = {snap.get('activeOpacity', 0.92)}, inactive_opacity = {snap.get('inactiveOpacity', 0.82)} }} }})")
+        anim_val = "true" if snap.get("animationsEnabled", True) else "false"
+        hypr_eval(f"hl.config({{ animations = {{ enabled = {anim_val} }} }})")
+        return
+
+
+    bar_blur = snap.get("barBlur", True)
+    bar_mode = snap.get("barColorMode", "theme")
+    bar_color = snap.get("barColor", "")
+    bar_opacity = snap.get("barGlassOpacity", 0.60)
+
+    cmd = [
+        str(GLASS_CTL), "set",
+        str(snap.get("activeOpacity", 0.92)),
+        str(snap.get("inactiveOpacity", 0.82)),
+        "true" if snap.get("blurEnabled", True) else "false",
+        str(snap.get("blurPasses", 3)),
+        str(snap.get("blurSize", 3)),
+        "true" if bar_blur else "false",
+        bar_mode,
+        bar_color or "",
+        str(bar_opacity),
+    ]
+    subprocess.run(cmd, capture_output=True)
+
+    # Restore animation state separately (glass-ctl doesn't manage this)
+    anim_was_on = snap.get("animationsEnabled", True)
+    hypr_eval("hl.config({ animations = { enabled = " + ("true" if anim_was_on else "false") + " } })")
+
+
+def notify(summary: str, body: str = "", icon: str = "battery"):
+    """Fire a desktop notification non-blocking."""
+    try:
+        subprocess.Popen(["notify-send", "-i", icon, "-t", "4000", summary, body])
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Core commands
+# ---------------------------------------------------------------------------
+
+def cmd_get():
+    cfg = load_config()
+    battery = get_battery_info()
+    ac = is_ac_online()
+    watts = get_power_draw_watts()
+    # Use live sysfs watts when available; fall back to upower rate field
+    if watts == 0.0:
+        rate_str = battery.get("rate", "0W")
+        try:
+            watts = float(re.sub(r"[^\d.]", "", rate_str))
+        except Exception:
+            watts = 0.0
+
+    out = {
+        "active":            cfg.get("active", False),
+        "auto_switch":       cfg.get("auto_switch_battery", False),
+        "adjust_blur":       cfg.get("adjust_blur", True),
+        "adjust_opacity":    cfg.get("adjust_opacity", True),
+        "adjust_animations": cfg.get("adjust_animations", True),
+        "adjust_brightness": cfg.get("adjust_brightness", True),
+        "target_brightness": cfg.get("target_brightness", 35),
+        "adjust_powerprofile": cfg.get("adjust_powerprofile", True),
+        "telemetry": {
+            "percentage":  battery.get("percentage", ""),
+            "time":        battery.get("time", ""),
+            "rate_watts":  round(watts, 1),
+            "ac_online":   ac,
+            "state":       battery.get("state", ""),
+        },
+    }
+    print(json.dumps(out))
+
+
+def cmd_toggle(force: str | None = None):
+    """
+    Toggle eco mode.
+    force = "on"  → always enable
+    force = "off" → always disable
+    force = None  → flip current state
+    """
+    cfg = load_config()
+    currently_active = cfg.get("active", False)
+
+    if force == "on":
+        target = True
+    elif force == "off":
+        target = False
+    else:
+        target = not currently_active
+
+    if target == currently_active:
+        # Already in desired state; no-op but print current state
+        cmd_get()
+        return
+
+    if target:
+        _eco_on(cfg)
+    else:
+        _eco_off(cfg)
+
+
+def _eco_on(cfg: dict):
+    # 1. Snapshot current visual state
+    glass = get_glass_state()
+    brightness_raw = get_brightness_raw()
+    brightness_max = get_brightness_max()
+    brightness_pct = round(brightness_raw / brightness_max * 100) if brightness_max > 0 else 100
+
+    anim_enabled = hypr_get("misc:animate_manual_resizes").get("bool", True)
+    # More reliable: query top-level animations enabled
+    anim_raw = hypr_get("animations:enabled")
+    anim_enabled = anim_raw.get("bool", True)
+
+    snap = {
+        **glass,
+        "animationsEnabled": anim_enabled,
+        "brightnessPct": brightness_pct,
+        "brightnessRaw": brightness_raw,
+    }
+    save_snapshot(snap)
+
+    # 2. Apply eco adjustments
+    if cfg.get("adjust_blur", True):
+        hypr_eval("hl.config({ decoration = { blur = { enabled = false } } })")
+
+    if cfg.get("adjust_opacity", True):
+        hypr_eval("hl.config({ decoration = { active_opacity = 1.0, inactive_opacity = 1.0 } })")
+
+    if cfg.get("adjust_animations", True):
+        hypr_eval("hl.config({ animations = { enabled = false } })")
+
+
+    if cfg.get("adjust_brightness", True):
+        target_pct = cfg.get("target_brightness", 35)
+        set_brightness_pct(target_pct)
+
+    if cfg.get("adjust_powerprofile", True):
+        run(["powerprofilesctl", "set", "power-saver"])
+
+    # 3. Persist active state
+    cfg["active"] = True
+    save_config(cfg)
+
+    notify("Eco Mode ON", "Blur, animations, and brightness reduced to save battery.", "battery-caution")
+    cmd_get()
+
+
+def _eco_off(cfg: dict):
+    snap = load_snapshot()
+
+    # 1. Restore brightness
+    if cfg.get("adjust_brightness", True) and snap:
+        pct = snap.get("brightnessPct", 91)
+        set_brightness_pct(pct)
+
+    # 2. Restore glass/Hyprland state
+    if snap:
+        restore_glass_state(snap)
+    else:
+        # No snapshot — fallback: re-enable with safe defaults
+        hypr_eval("hl.config({ decoration = { blur = { enabled = true } } })")
+        hypr_eval("hl.config({ decoration = { active_opacity = 0.92, inactive_opacity = 0.82 } })")
+        hypr_eval("hl.config({ animations = { enabled = true } })")
+
+
+    # 3. Restore power profile
+    if cfg.get("adjust_powerprofile", True):
+        run(["powerprofilesctl", "set", "balanced"])
+
+    # 4. Persist
+    cfg["active"] = False
+    save_config(cfg)
+
+    notify("Eco Mode OFF", "Visual effects and power profile restored.", "battery-full")
+    cmd_get()
+
+
+def cmd_set_config(key: str, value: str):
+    """Persist a single user preference."""
+    cfg = load_config()
+    bool_keys = {
+        "auto_switch_battery", "adjust_blur", "adjust_opacity",
+        "adjust_animations", "adjust_brightness", "adjust_powerprofile",
+    }
+    int_keys = {"target_brightness"}
+    if key in bool_keys:
+        cfg[key] = value.lower() in ("true", "1", "yes", "on")
+    elif key in int_keys:
+        try:
+            cfg[key] = max(5, min(100, int(value)))
+        except ValueError:
+            print(json.dumps({"error": f"Invalid integer for {key}: {value}"}))
+            sys.exit(1)
+    else:
+        print(json.dumps({"error": f"Unknown config key: {key}"}))
+        sys.exit(1)
+    save_config(cfg)
+    print(json.dumps({"ok": True, "key": key, "value": cfg[key]}))
+
+
+def cmd_poll():
+    """
+    Called periodically (e.g., every 5s from Service.qml).
+    Detects AC↔battery transitions and auto-triggers eco mode if configured.
+    """
+    cfg = load_config()
+    if not cfg.get("auto_switch_battery", False):
+        # Auto-switch disabled; still report current state
+        cmd_get()
+        return
+
+    ac_now = is_ac_online()
+    last_ac = cfg.get("_last_ac")
+
+    # Persist transition detection state
+    if last_ac != ac_now:
+        cfg["_last_ac"] = ac_now
+        save_config(cfg)
+
+        if not ac_now and not cfg.get("active", False):
+            # Charger unplugged → enable eco
+            _eco_on(cfg)
+            return
+        elif ac_now and cfg.get("active", False):
+            # Charger plugged in → disable eco
+            cfg_fresh = load_config()  # reload after potential _eco_on mutation
+            _eco_off(cfg_fresh)
+            return
+
+    cmd_get()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+
+    if not args or args[0] == "get":
+        cmd_get()
+
+    elif args[0] == "toggle":
+        force = args[1].lower() if len(args) > 1 else None
+        if force not in (None, "on", "off"):
+            force = None
+        cmd_toggle(force)
+
+    elif args[0] == "set-config" and len(args) == 3:
+        cmd_set_config(args[1], args[2])
+
+    elif args[0] == "poll":
+        cmd_poll()
+
+    else:
+        print("Usage: eco-ctl [get | toggle [on|off] | set-config <key> <value> | poll]",
+              file=sys.stderr)
+        sys.exit(1)

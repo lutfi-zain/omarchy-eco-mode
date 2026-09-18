@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "lutfi.eco",
+  "name": "Eco Mode Manager",
+  "version": "1.0.0",
+  "author": "Lutfi Zain",
+  "license": "MIT",
+  "description": "Toggle eco mode to save battery by disabling GPU blur, animations, capping brightness, and switching power profiles",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Eco Mode",
+    "description": "Power-saving mode manager with granular controls",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
